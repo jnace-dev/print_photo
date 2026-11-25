@@ -1,0 +1,14 @@
+apply_print_settings 失败: (5, 'SetPrinter', '拒绝访问。')
+Traceback (most recent call last):
+  File "D:\ai/print_photo\print_photo.py", line 159, in apply_print_settings
+    win32print.SetPrinter(hprinter, 2, info, 0)
+    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+pywintypes.error: (5, 'SetPrinter', '拒绝访问。')
+
+apply_print_settings 失败: (5, 'SetPrinter', '拒绝访问。')
+Traceback (most recent call last):
+  File "D:\ai/print_photo\print_photo.py", line 159, in apply_print_settings
+    win32print.SetPrinter(hprinter, 2, info, 0)
+    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+pywintypes.error: (5, 'SetPrinter', '拒绝访问。')
+
