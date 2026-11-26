@@ -43,6 +43,16 @@ PAPER_SIZES = {
 BUTTON_WIDTH = 12
 # spec 6.1.3: 启动完成时间上限(秒)
 STARTUP_TIME_LIMIT = 1
+# 性能指标上限(秒)
+PREVIEW_REDRAW_TIME_LIMIT = 0.5
+LIST_REFRESH_TIME_LIMIT = 2.0
+PAGE_COMPOSE_TIME_LIMIT = 1.0
+MEASURE_PRECISION = 0.001
+# exe 体积指标(字节 / 百分比)
+EXE_SIZE_LIMIT = 52428800
+CURRENT_EXE_SIZE_BASELINE = 178330724
+VOLUME_REDUCTION_RATIO = 70.0
+VOLUME_MEASURE_PRECISION = 1
 # spec 6.1.2: TCombobox 内边距 (水平, 垂直)
 COMBOBOX_PADDING = (4, 4)
 # 应用标题与日志文件路径
@@ -72,6 +82,77 @@ def log(msg):
             f.write(msg + "\n")
     except Exception:
         pass
+# ---------------------------------------------------------------------------
+# 图片缓存层
+# ---------------------------------------------------------------------------
+class ImageCache:
+    """以 (路径, 尺寸) 为键缓存 PIL.Image，消除重复解码。"""
+    def __init__(self):
+        self._cache = {}
+    def get_thumbnail(self, path, size):
+        return self._get(path, size, to_rgb=True)
+    def get_preview_image(self, path, size):
+        return self._get(path, size, to_rgb=True)
+    def get_fitted_image(self, path, box):
+        return self._get(path, box, to_rgb=True)
+    def invalidate(self):
+        self._cache.clear()
+    def _get(self, path, box, to_rgb):
+        key = (path, tuple(box))
+        if key in self._cache:
+            return self._cache[key]
+        img = self._decode_and_fit(path, box, to_rgb)
+        if img is not None:
+            self._cache[key] = img
+        return img
+    def _decode_and_fit(self, path, box, to_rgb):
+        from PIL import Image
+        try:
+            im = Image.open(path)
+            im.draft("RGB", tuple(box))
+            w, h = im.size
+            bw, bh = box
+            if w <= 0 or h <= 0:
+                return None
+            scale = min(bw / w, bh / h)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            if new_w != w or new_h != h:
+                try:
+                    resample = Image.LANCZOS
+                except AttributeError:
+                    resample = Image.ANTIALIAS
+                im = im.resize((new_w, new_h), resample)
+            if to_rgb and im.mode != "RGB":
+                im = im.convert("RGB")
+            return im
+        except Exception:
+            return None
+# ---------------------------------------------------------------------------
+# 性能测量层
+# ---------------------------------------------------------------------------
+class PerfMeasure:
+    """集中化耗时测量与日志写入，测量异常静默降级不影响业务。"""
+    def measure(self, op_name, limit, func, *args, **kwargs):
+        t0 = time.time()
+        try:
+            result = func(*args, **kwargs)
+        except Exception:
+            t1 = time.time()
+            self._try_log(op_name, t1 - t0, limit, True)
+            raise
+        t1 = time.time()
+        elapsed = t1 - t0
+        self._try_log(op_name, elapsed, limit, elapsed > limit)
+        return result
+    def _try_log(self, op_name, elapsed, limit, exceeded):
+        try:
+            self._log(op_name, elapsed, limit, exceeded)
+        except Exception:
+            pass
+    def _log(self, op_name, elapsed, limit, exceeded):
+        flag = "超标" if exceeded else "达标"
+        log("%s: %.3f 秒 (上限 %.3f 秒) %s" % (op_name, elapsed, limit, flag))
 # ---------------------------------------------------------------------------
 # 打印机 / DEVMODE 操作
 # ---------------------------------------------------------------------------
@@ -183,13 +264,17 @@ def restore_print_settings(printer_name, original):
                 win32print.ClosePrinter(hprinter)
             except Exception:
                 pass
+# 模块级缓存与测量实例
+_page_cache = ImageCache()
+_perf = PerfMeasure()
 # ---------------------------------------------------------------------------
 # 图像 / 页面合成
 # ---------------------------------------------------------------------------
 def fit_image(img, box_w, box_h):
     """将图像等比缩放放入 box_w x box_h 内(RGB)。"""
     from PIL import Image
-    img = img.convert("RGB")
+    if img.mode != "RGB":
+        img = img.convert("RGB")
     w, h = img.size
     if w <= 0 or h <= 0:
         return img
@@ -206,22 +291,22 @@ def fit_image(img, box_w, box_h):
     return img
 def compose_page(image_paths_batch, layout, printable_w, printable_h):
     """把一批照片合成一页图像(白底)。"""
+    return _perf.measure("页面合成", PAGE_COMPOSE_TIME_LIMIT,
+                         _compose_page_impl, image_paths_batch, layout, printable_w, printable_h)
+def _compose_page_impl(image_paths_batch, layout, printable_w, printable_h):
+    """页面合成实际逻辑，经缓存取图。"""
     from PIL import Image
     page = Image.new("RGB", (printable_w, printable_h), "white")
     rows, cols, _ = LAYOUTS[layout]
-    # 单元格间距，随纸张尺寸自适应
     gap = max(2, int(min(printable_w, printable_h) * 0.008))
     cell_w = (printable_w - gap * (cols + 1)) // cols
     cell_h = (printable_h - gap * (rows + 1)) // rows
     for idx, path in enumerate(image_paths_batch):
-        try:
-            img = Image.open(path)
-        except Exception as e:
-            log("无法打开图像 %s: %s" % (path, e))
+        fitted = _page_cache.get_fitted_image(path, (cell_w, cell_h))
+        if fitted is None:
+            log("无法合成图像 %s" % path)
             continue
-        fitted = fit_image(img, cell_w, cell_h)
         fw, fh = fitted.size
-        # 计算单元格中的居中位置
         r = idx // cols
         c = idx % cols
         x = gap + c * (cell_w + gap) + (cell_w - fw) // 2
@@ -309,6 +394,11 @@ class PhotoPrintApp:
         self.thumbnails = []
         self.printing = False
         self._preview_ready = False
+        self._preview_img = []
+        self._preview_cache = ImageCache()
+        self._thumb_cache = ImageCache()
+        self._page_cache = _page_cache
+        self._perf = _perf
         self._build_ui()
         self.root.after(0, self._refresh_printers)
     # -- UI 构建 -----------------------------------------------------------
@@ -461,6 +551,9 @@ class PhotoPrintApp:
         for f in files:
             if f not in self.image_paths:
                 self.image_paths.append(f)
+        self._preview_cache.invalidate()
+        self._thumb_cache.invalidate()
+        self._page_cache.invalidate()
         self._refresh_list()
         self._draw_preview()
     def remove_selected(self):
@@ -471,6 +564,9 @@ class PhotoPrintApp:
         indices = [self.tree.index(item) for item in sel]
         for i in sorted(indices, reverse=True):
             del self.image_paths[i]
+        self._preview_cache.invalidate()
+        self._thumb_cache.invalidate()
+        self._page_cache.invalidate()
         self._refresh_list()
         self._draw_preview()
     def clear_photos(self):
@@ -478,20 +574,25 @@ class PhotoPrintApp:
             return
         if messagebox.askyesno("确认", "清空所有照片?"):
             self.image_paths = []
+            self._preview_cache.invalidate()
+            self._thumb_cache.invalidate()
+            self._page_cache.invalidate()
             self._refresh_list()
             self._draw_preview()
     def _refresh_list(self):
-        from PIL import Image, ImageTk
         self.tree.delete(*self.tree.get_children())
         self.thumbnails = []
+        return self._perf.measure("列表刷新", LIST_REFRESH_TIME_LIMIT,
+                                  self._refresh_list_impl)
+    def _refresh_list_impl(self):
         for i, p in enumerate(self.image_paths):
             name = os.path.basename(p)
-            try:
-                im = Image.open(p)
-                im.thumbnail((48, 48))
+            im = self._thumb_cache.get_thumbnail(p, (48, 48))
+            if im is not None:
+                from PIL import ImageTk
                 th = ImageTk.PhotoImage(im)
                 self.thumbnails.append(th)
-            except Exception:
+            else:
                 th = None
                 self.thumbnails.append(None)
             self.tree.insert("", "end", text="%d. %s" % (i + 1, name),
@@ -519,11 +620,15 @@ class PhotoPrintApp:
                                      fill="white", outline="#888888", width=2)
     def _draw_preview(self, _event=None):
         self.canvas.delete("all")
+        self._preview_img = []
         if not self._preview_ready:
             self._preview_ready = True
             self._draw_paper_frame()
             self.root.after(0, self._draw_preview)
             return
+        return self._perf.measure("预览重绘", PREVIEW_REDRAW_TIME_LIMIT,
+                                  self._draw_preview_impl)
+    def _draw_preview_impl(self):
         w = self.canvas.winfo_width()
         h = self.canvas.winfo_height()
         if w <= 4 or h <= 4:
@@ -532,10 +637,8 @@ class PhotoPrintApp:
         if layout not in LAYOUTS:
             return
         rows, cols, count = LAYOUTS[layout]
-        # paper 比例 (默认 A4 纵向)
         paper_w_ratio, paper_h_ratio = 210, 297
         pad = 16
-        # 计算纸张绘制区域
         avail_w = w - pad * 2
         avail_h = h - pad * 2
         if avail_w <= 0 or avail_h <= 0:
@@ -547,7 +650,6 @@ class PhotoPrintApp:
         py = (h - ph) / 2
         self.canvas.create_rectangle(px, py, px + pw, py + ph,
                                      fill="white", outline="#888888", width=2)
-        # 网格
         gap = 4
         cw = (pw - gap * (cols + 1)) / cols
         ch = (ph - gap * (rows + 1)) / rows
@@ -559,14 +661,15 @@ class PhotoPrintApp:
                                              fill="#e8e8e8", outline="#bbbbbb")
                 idx = r * cols + c
                 if idx < len(self.image_paths):
-                    from PIL import Image, ImageTk
-                    try:
-                        im = Image.open(self.image_paths[idx])
-                        im.thumbnail((int(cw), int(ch)))
-                        self._preview_img = ImageTk.PhotoImage(im)
+                    im = self._preview_cache.get_preview_image(
+                        self.image_paths[idx], (int(cw), int(ch)))
+                    if im is not None:
+                        from PIL import ImageTk
+                        photo = ImageTk.PhotoImage(im)
+                        self._preview_img.append(photo)
                         self.canvas.create_image(x + cw / 2, y + ch / 2,
-                                                 image=self._preview_img)
-                    except Exception:
+                                                 image=photo)
+                    else:
                         self.canvas.create_text(x + cw / 2, y + ch / 2,
                                                 text=str(idx + 1), fill="#999999")
                 else:
@@ -671,6 +774,44 @@ def _create_splash(root):
              font=("Segoe UI", 9)).pack(side=tk.BOTTOM, pady=(0, 16))
     splash.update_idletasks()
     return splash
+def safe_build():
+    """构建安全机制: 输出至临时目录, 成功替换 dist, 失败保留原产物, 度量体积写日志。"""
+    import shutil
+    import subprocess
+    spec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "照片打印工具.spec")
+    dist_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist")
+    build_tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "build_tmp")
+    exe_name = "照片打印工具.exe"
+    if os.path.exists(build_tmp):
+        shutil.rmtree(build_tmp, ignore_errors=True)
+    cmd = [sys.executable, "-m", "PyInstaller", "--clean", "--workpath",
+           build_tmp, "--distpath", build_tmp, spec_path]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except Exception as e:
+        log("构建失败: 无法启动 PyInstaller: %s" % e)
+        return False
+    if proc.returncode != 0:
+        log("构建失败: 返回码 %d\n%s" % (proc.returncode, proc.stdout[-2000:]))
+        return False
+    built_exe = os.path.join(build_tmp, exe_name)
+    if not os.path.exists(built_exe):
+        log("构建失败: 产物未生成 %s" % built_exe)
+        return False
+    size = os.path.getsize(built_exe)
+    ratio = (1 - size / CURRENT_EXE_SIZE_BASELINE) * 100
+    ok = size <= EXE_SIZE_LIMIT
+    log("exe 体积: %d 字节 (上限 %d 字节) %s; 基准 %d 字节; 缩减 %.2f%% (下限 %.1f%%) %s"
+        % (size, EXE_SIZE_LIMIT, "达标" if ok else "超标",
+           CURRENT_EXE_SIZE_BASELINE, ratio, VOLUME_REDUCTION_RATIO,
+           "达标" if ratio >= VOLUME_REDUCTION_RATIO else "未达标"))
+    if os.path.exists(dist_dir):
+        shutil.rmtree(dist_dir, ignore_errors=True)
+    shutil.move(build_tmp, dist_dir)
+    log("构建成功: dist 已更新")
+    return True
 def main():
     try:
         t0 = time.time()
