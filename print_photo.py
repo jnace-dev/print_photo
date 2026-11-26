@@ -91,21 +91,21 @@ class ImageCache:
         self._cache = {}
     def get_thumbnail(self, path, size):
         return self._get(path, size, to_rgb=True)
-    def get_preview_image(self, path, size):
-        return self._get(path, size, to_rgb=True)
-    def get_fitted_image(self, path, box):
-        return self._get(path, box, to_rgb=True)
+    def get_preview_image(self, path, size, rotate=False):
+        return self._get(path, size, to_rgb=True, rotate=rotate)
+    def get_fitted_image(self, path, box, rotate=False):
+        return self._get(path, box, to_rgb=True, rotate=rotate)
     def invalidate(self):
         self._cache.clear()
-    def _get(self, path, box, to_rgb):
-        key = (path, tuple(box))
+    def _get(self, path, box, to_rgb, rotate=False):
+        key = (path, tuple(box), rotate)
         if key in self._cache:
             return self._cache[key]
-        img = self._decode_and_fit(path, box, to_rgb)
+        img = self._decode_and_fit(path, box, to_rgb, rotate)
         if img is not None:
             self._cache[key] = img
         return img
-    def _decode_and_fit(self, path, box, to_rgb):
+    def _decode_and_fit(self, path, box, to_rgb, rotate=False):
         from PIL import Image
         try:
             im = Image.open(path)
@@ -114,6 +114,10 @@ class ImageCache:
             bw, bh = box
             if w <= 0 or h <= 0:
                 return None
+            # 90度旋转: 交换宽高使图片在页面中最大化
+            if rotate:
+                im = im.transpose(Image.ROTATE_90)
+                w, h = im.size
             scale = min(bw / w, bh / h)
             new_w = max(1, int(round(w * scale)))
             new_h = max(1, int(round(h * scale)))
@@ -270,14 +274,18 @@ _perf = PerfMeasure()
 # ---------------------------------------------------------------------------
 # 图像 / 页面合成
 # ---------------------------------------------------------------------------
-def fit_image(img, box_w, box_h):
-    """将图像等比缩放放入 box_w x box_h 内(RGB)。"""
+def fit_image(img, box_w, box_h, rotate=False):
+    """将图像等比缩放放入 box_w x box_h 内(RGB)，可90度旋转。"""
     from PIL import Image
     if img.mode != "RGB":
         img = img.convert("RGB")
     w, h = img.size
     if w <= 0 or h <= 0:
         return img
+    # 90度旋转: 交换宽高使图片在页面中最大化
+    if rotate:
+        img = img.transpose(Image.ROTATE_90)
+        w, h = img.size
     # 等比缩放，取宽高比例中较小者确保完整放入
     scale = min(box_w / w, box_h / h)
     new_w = max(1, int(round(w * scale)))
@@ -289,12 +297,12 @@ def fit_image(img, box_w, box_h):
             resample = Image.ANTIALIAS
         img = img.resize((new_w, new_h), resample)
     return img
-def compose_page(image_paths_batch, layout, printable_w, printable_h):
-    """把一批照片合成一页图像(白底)。"""
+def compose_page(image_paths_batch, layout, printable_w, printable_h, rotate=False):
+    """把一批照片合成一页图像(白底)，可90度旋转。"""
     return _perf.measure("页面合成", PAGE_COMPOSE_TIME_LIMIT,
-                         _compose_page_impl, image_paths_batch, layout, printable_w, printable_h)
-def _compose_page_impl(image_paths_batch, layout, printable_w, printable_h):
-    """页面合成实际逻辑，经缓存取图。"""
+                         _compose_page_impl, image_paths_batch, layout, printable_w, printable_h, rotate)
+def _compose_page_impl(image_paths_batch, layout, printable_w, printable_h, rotate=False):
+    """页面合成实际逻辑，经缓存取图，可90度旋转。"""
     from PIL import Image
     page = Image.new("RGB", (printable_w, printable_h), "white")
     rows, cols, _ = LAYOUTS[layout]
@@ -302,7 +310,7 @@ def _compose_page_impl(image_paths_batch, layout, printable_w, printable_h):
     cell_w = (printable_w - gap * (cols + 1)) // cols
     cell_h = (printable_h - gap * (rows + 1)) // rows
     for idx, path in enumerate(image_paths_batch):
-        fitted = _page_cache.get_fitted_image(path, (cell_w, cell_h))
+        fitted = _page_cache.get_fitted_image(path, (cell_w, cell_h), rotate)
         if fitted is None:
             log("无法合成图像 %s" % path)
             continue
@@ -324,7 +332,7 @@ def build_pages(image_paths, layout):
 # 打印
 # ---------------------------------------------------------------------------
 def do_print(image_paths, printer_name, layout, copies, duplex_mode, paper_key,
-             progress_cb=None):
+             progress_cb=None, rotate=False):
     """执行打印。progress_cb(current, total) 用于回调进度。返回 (ok, msg)。"""
     from PIL import ImageWin
     import win32ui, win32con
@@ -353,7 +361,7 @@ def do_print(image_paths, printer_name, layout, copies, duplex_mode, paper_key,
             for copy in range(copies):
                 for batch in pages:
                     try:
-                        page_img = compose_page(batch, layout, printable_w, printable_h)
+                        page_img = compose_page(batch, layout, printable_w, printable_h, rotate)
                         dib = ImageWin.Dib(page_img)
                         dc.StartPage()
                         try:
@@ -399,6 +407,7 @@ class PhotoPrintApp:
         self._thumb_cache = ImageCache()
         self._page_cache = _page_cache
         self._perf = _perf
+        self.rotate_var = tk.BooleanVar(value=False)
         self._build_ui()
         self.root.after(0, self._refresh_printers)
     # -- UI 构建 -----------------------------------------------------------
@@ -514,6 +523,12 @@ class PhotoPrintApp:
         self.rb_duplex_short = ttk.Radiobutton(row2, text="双面(短边翻页)日历",
                                                 variable=self.duplex_var, value=DUPLEX_HORIZONTAL)
         self.rb_duplex_short.pack(side=tk.LEFT)
+        # 90度旋转选项
+        row3 = ttk.Frame(settings)
+        row3.pack(fill=tk.X, pady=3)
+        self.cb_rotate = ttk.Checkbutton(row3, text="90度旋转图片", variable=self.rotate_var,
+                                         command=self._draw_preview)
+        self.cb_rotate.pack(side=tk.LEFT)
         # 底部: 进度条 + 状态文字 + 打印/关闭按钮
         bottom = ttk.Frame(self.root, padding=8)
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
@@ -662,7 +677,7 @@ class PhotoPrintApp:
                 idx = r * cols + c
                 if idx < len(self.image_paths):
                     im = self._preview_cache.get_preview_image(
-                        self.image_paths[idx], (int(cw), int(ch)))
+                        self.image_paths[idx], (int(cw), int(ch)), self.rotate_var.get())
                     if im is not None:
                         from PIL import ImageTk
                         photo = ImageTk.PhotoImage(im)
@@ -705,6 +720,7 @@ class PhotoPrintApp:
             copies = 1
         duplex = self.duplex_var.get()
         paper = self.cmb_paper.get()
+        rotate = self.rotate_var.get()
         # 禁用控件并启动后台打印线程
         self.printing = True
         self._set_controls_state(False)
@@ -714,7 +730,7 @@ class PhotoPrintApp:
             try:
                 ok, msg = do_print(
                     self.image_paths, printer, layout, copies, duplex, paper,
-                    progress_cb=lambda cur, tot: self._after(cur, tot),
+                    progress_cb=lambda cur, tot: self._after(cur, tot), rotate=rotate,
                 )
             except Exception as e:
                 ok, msg = False, "打印异常: %s\n%s" % (e, traceback.format_exc())
@@ -743,7 +759,8 @@ class PhotoPrintApp:
         for w in (self.btn_add, self.btn_remove, self.btn_clear,
                   self.btn_print, self.btn_refresh, self.cmb_layout,
                   self.cmb_paper, self.cmb_printer, self.spin_copies,
-                  self.rb_single, self.rb_duplex, self.rb_duplex_short):
+                  self.rb_single, self.rb_duplex, self.rb_duplex_short,
+                  self.cb_rotate):
             try:
                 w.config(state=state)
             except Exception:

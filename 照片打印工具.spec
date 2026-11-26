@@ -5,12 +5,12 @@ a = Analysis(
     ['print_photo.py'],
     pathex=[],
     binaries=[],
-    datas=[('D:/ai/print_photo/icon.ico', '.')],
+    datas=[],
     hiddenimports=['win32print', 'win32ui', 'win32con', 'win32api', 'PIL.ImageWin'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['matplotlib', 'scipy', 'pandas', 'PyQt5', 'PySide6'],
+    excludes=[],
     noarchive=False,
     optimize=0,
 )
@@ -35,6 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    version='D:/ai/print_photo/version.txt',
-    icon=['D:/ai/print_photo/icon.ico'],
+    icon=['icon.ico'],
 )
